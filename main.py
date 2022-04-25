@@ -42,22 +42,17 @@ import pprint
 import typing as t
 from dataclasses import dataclass
 
-from bitcoin import SelectParams
-from bitcoin.core import (
+from test_framework import script
+from test_framework.messages import (
     CTransaction,
-    CMutableTransaction,
-    CMutableTxIn,
     CTxIn,
     CTxOut,
-    CScript,
     COutPoint,
     CTxWitness,
     CTxInWitness,
-    CScriptWitness,
     COIN,
 )
-from bitcoin.core import script
-from bitcoin.wallet import CBech32BitcoinAddress
+from test_framework.script import CScript
 from buidl.hd import HDPrivateKey, PrivateKey
 from buidl.ecc import S256Point
 from rpc import BitcoinRPC, JSONRPCError
@@ -76,7 +71,7 @@ Txid = str
 RawTxStr = str
 
 # For use with template transactions.
-BLANK_INPUT = CMutableTxIn
+BLANK_INPUT = CTxIn
 
 
 @dataclass(frozen=True)
@@ -91,7 +86,7 @@ class Coin:
         tx = rpc.getrawtransaction(txid, True)
         txout = tx["vout"][n]
         return cls(
-            COutPoint(txid_to_bytes(txid), n),
+            COutPoint(int(txid, 16), n),
             amount=int(txout["value"] * COIN),
             scriptPubKey=bytes.fromhex(txout["scriptPubKey"]["hex"]),
             height=rpc.getblock(tx["blockhash"])["height"],
@@ -122,7 +117,7 @@ class Wallet:
         for utxo in scan["unspents"]:
             self.coins.append(
                 Coin(
-                    COutPoint(txid_to_bytes(utxo["txid"]), utxo["vout"]),
+                    COutPoint(int(utxo["txid"], 16), utxo["vout"]),
                     int(utxo["amount"] * COIN),
                     bytes.fromhex(utxo["scriptPubKey"]),
                     utxo["height"],
@@ -184,17 +179,14 @@ class VaultPlan:
         everything.
         """
 
-        def get_txid(tx: CMutableTransaction) -> TxidStr:
-            return bytes_to_txid(tx.GetTxid())
+        self.tovault_txid: TxidStr = self.tovault_tx_unsigned.hash
+        self.tovault_outpoint = COutPoint(int(self.tovault_txid, 16), 0)
 
-        self.tovault_txid: TxidStr = get_txid(self.tovault_tx_unsigned)
-        self.tovault_outpoint = COutPoint(txid_to_bytes(self.tovault_txid), 0)
+        self.unvault_txid: TxidStr = self.unvault_tx_unsigned.hash
+        self.unvault_outpoint = COutPoint(int(self.unvault_txid, 16), 0)
 
-        self.unvault_txid: TxidStr = get_txid(self.unvault_tx_unsigned)
-        self.unvault_outpoint = COutPoint(txid_to_bytes(self.unvault_txid), 0)
-
-        self.tohot_txid = get_txid(self.tohot_tx_unsigned)
-        self.tocold_txid = get_txid(self.tocold_tx_unsigned)
+        self.tohot_txid = self.tohot_tx_unsigned.hash
+        self.tocold_txid = self.tocold_tx_unsigned.hash
 
     def amount_at_step(self, step=0) -> Sats:
         """
@@ -210,14 +202,14 @@ class VaultPlan:
     # -------------------------------
 
     @property
-    def tovault_tx_unsigned(self) -> CMutableTransaction:
+    def tovault_tx_unsigned(self) -> CTransaction:
         """
         Spend from a P2WPKH output into a new vault.
 
         The output is a bare OP_CTV script, which consumes less chain space
         than a P2(W)SH.
         """
-        tx = CMutableTransaction()
+        tx = CTransaction()
         tx.nVersion = 2
         tx.vin = [CTxIn(self.coin_in.outpoint, nSequence=0)]  # signal for RBF
         tx.vout = [
@@ -226,40 +218,36 @@ class VaultPlan:
                 CScript([self.unvault_ctv_hash, OP_CHECKTEMPLATEVERIFY]),
             )
         ]
+        tx.calc_sha256()
         return tx
 
     def sign_tovault_tx(self, from_privkey: PrivateKey) -> CTransaction:
         tx = self.tovault_tx_unsigned
-
-        spend_from_addr = CBech32BitcoinAddress.from_scriptPubKey(
-            CScript(self.coin_in.scriptPubKey)
-        )
 
         # Standard p2wpkh redeemScript
         redeem_script = CScript(
             [
                 script.OP_DUP,
                 script.OP_HASH160,
-                spend_from_addr,
+                self.coin_in.scriptPubKey[2:],
                 script.OP_EQUALVERIFY,
                 script.OP_CHECKSIG,
             ]
         )
 
-        sighash = script.SignatureHash(
+        sighash = script.SegwitV0SignatureHash(
             redeem_script,
             tx,
             0,  # input index
             script.SIGHASH_ALL,
             amount=self.coin_in.amount,
-            sigversion=script.SIGVERSION_WITNESS_V0,
         )
         sig = from_privkey.sign(int.from_bytes(sighash, "big")).der() + bytes(
             [script.SIGHASH_ALL]
         )
-        wit = [CTxInWitness(CScriptWitness([sig, from_privkey.point.sec()]))]
-        tx.wit = CTxWitness(wit)
-        return CTransaction.from_tx(tx)
+        tx.wit.vtxinwit.append(CTxInWitness())
+        tx.wit.vtxinwit[0].scriptWitness.stack = [sig, from_privkey.point.sec()]
+        return CTransaction(tx)
 
     # unvault transaction
     # -------------------------------
@@ -270,7 +258,7 @@ class VaultPlan:
         return get_standard_template_hash(self.unvault_tx_template, 0)
 
     @property
-    def unvault_tx_template(self) -> CMutableTransaction:
+    def unvault_tx_template(self) -> CTransaction:
         """
         Return the transaction that initiates the unvaulting process.
 
@@ -281,7 +269,7 @@ class VaultPlan:
         it doesn't matter for the purposes of computing the CTV hash.
         """
         # Used to compute CTV hashes, but not used in any final transactions.
-        tx = CMutableTransaction()
+        tx = CTransaction()
         tx.nVersion = 2
         # We can leave this as a dummy input, since the coin we're spending here is
         # encumbered solely by CTV, e.g.
@@ -298,6 +286,7 @@ class VaultPlan:
                 CScript([script.OP_0, sha256(self.unvault_redeemScript)]),
             )
         ]
+        tx.calc_sha256()
         return tx
 
     @property
@@ -316,10 +305,11 @@ class VaultPlan:
         )
 
     @property
-    def unvault_tx_unsigned(self) -> CMutableTransaction:
+    def unvault_tx_unsigned(self) -> CTransaction:
         tx = self.unvault_tx_template
         tx.vin = [CTxIn(self.tovault_outpoint)]
-        return CTransaction.from_tx(tx)
+        tx.rehash()
+        return CTransaction(tx)
 
     def sign_unvault_tx(self):
         # No signing necessary with a bare CTV output!
@@ -329,7 +319,7 @@ class VaultPlan:
     # -------------------------------
 
     @property
-    def tocold_tx_template(self) -> CMutableTransaction:
+    def tocold_tx_template(self) -> CTransaction:
         """Return the transaction that sweeps vault funds to the cold destination."""
         # scriptSig consists of a single push-0 to control the if-block above.
         return p2wpkh_tx_template(
@@ -344,26 +334,28 @@ class VaultPlan:
         return get_standard_template_hash(self.tocold_tx_template, 0)
 
     @property
-    def tocold_tx_unsigned(self) -> CMutableTransaction:
+    def tocold_tx_unsigned(self) -> CTransaction:
         """Sends funds to the cold wallet from the unvault transaction."""
         tx = self.tocold_tx_template
-        unvault_outpoint = COutPoint(txid_to_bytes(self.unvault_txid), 0)
+        unvault_outpoint = COutPoint(int(self.unvault_txid, 16), 0)
         tx.vin = [CTxIn(unvault_outpoint)]
+        tx.rehash()
         return tx
 
     def sign_tocold_tx(self):
         tx = self.tocold_tx_unsigned
         # Use the amount from the last step for the sighash.
-        witness = CScriptWitness([b"", self.unvault_redeemScript])
-        tx.wit = CTxWitness([CTxInWitness(witness)])
+        tx.wit = CTxWitness()
+        tx.wit.vtxinwit.append(CTxInWitness())
+        tx.wit.vtxinwit[0].scriptWitness.stack = [b"", self.unvault_redeemScript]
 
-        return CTransaction.from_tx(tx)
+        return CTransaction(tx)
 
     # tohot transaction
     # -------------------------------
 
     @property
-    def tohot_tx_template(self) -> CMutableTransaction:
+    def tohot_tx_template(self) -> CTransaction:
         return p2wpkh_tx_template(
             [BLANK_INPUT()],
             self.amount_at_step(3),
@@ -372,10 +364,11 @@ class VaultPlan:
         )
 
     @property
-    def tohot_tx_unsigned(self) -> CMutableTransaction:
+    def tohot_tx_unsigned(self) -> CTransaction:
         """Sends funds to the hot wallet from the unvault transaction."""
         tx = self.tohot_tx_template
         tx.vin = [CTxIn(self.unvault_outpoint, nSequence=self.block_delay)]
+        tx.rehash()
         return tx
 
     def sign_tohot_tx(self, hot_priv: PrivateKey) -> CTransaction:
@@ -385,35 +378,32 @@ class VaultPlan:
         """
         tx = self.tohot_tx_unsigned
 
-        sighash = script.SignatureHash(
+        sighash = script.SegwitV0SignatureHash(
             self.unvault_redeemScript,
             tx,
             0,
             script.SIGHASH_ALL,
             amount=self.amount_at_step(2),  # the prior step amount
-            sigversion=script.SIGVERSION_WITNESS_V0,
         )
         sig = hot_priv.sign(int.from_bytes(sighash, "big")).der() + bytes(
             [script.SIGHASH_ALL]
         )
-        witness = CScriptWitness([sig, b"\x01", self.unvault_redeemScript])
-        tx.wit = CTxWitness([CTxInWitness(witness)])
+        tx.wit.vtxinwit.append(CTxInWitness())
+        tx.wit.vtxinwit[0].scriptWitness.stack = [sig, b"\x01", self.unvault_redeemScript]
 
-        return CTransaction.from_tx(tx)
+        return CTransaction(tx)
 
 
 def p2wpkh_tx_template(
     vin: t.List[CTxIn], nValue: int, pay_to_h160: bytes, fee_mgmt_pay_to_h160: bytes
-) -> CMutableTransaction:
+) -> CTransaction:
     """Create a transaction template paying into a P2WPKH."""
     pay_to_script = CScript([script.OP_0, pay_to_h160])
-    assert pay_to_script.is_witness_v0_keyhash()
 
     pay_to_fee_script = CScript([script.OP_0, fee_mgmt_pay_to_h160])
-    assert pay_to_fee_script.is_witness_v0_keyhash()
     HOPEFULLY_NOT_DUST: Sats = 550  # obviously TOOD?
 
-    tx = CMutableTransaction()
+    tx = CTransaction()
     tx.nVersion = 2
     tx.vin = vin
     tx.vout = [
@@ -421,6 +411,7 @@ def p2wpkh_tx_template(
         # Anchor output for CPFP-based fee bumps
         CTxOut(HOPEFULLY_NOT_DUST, pay_to_fee_script),
     ]
+    tx.calc_sha256()
     return tx
 
 
@@ -473,7 +464,7 @@ class VaultExecutor:
         (tx, hx) = self._print_signed_tx(self.plan.sign_tovault_tx, spend_key)
 
         txid = self.rpc.sendrawtransaction(hx)
-        assert txid == tx.GetTxid()[::-1].hex() == self.plan.tovault_txid
+        assert txid == tx.hash == self.plan.tovault_txid
 
         self.log()
         self.log(f"Coins are vaulted at {green(txid)}")
@@ -484,7 +475,7 @@ class VaultExecutor:
 
         _, hx = self._print_signed_tx(self.plan.sign_unvault_tx)
         txid = self.rpc.sendrawtransaction(hx)
-        self.unvault_outpoint = COutPoint(txid_to_bytes(txid), 0)
+        self.unvault_outpoint = COutPoint(int(txid, 16), 0)
         return txid
 
     def get_tocold_tx(self) -> CTransaction:
@@ -509,6 +500,7 @@ class VaultExecutor:
         """
         mempool_txids = self.rpc.getrawmempool(False)
 
+        print(self.plan.tovault_txid, self.plan.unvault_txid, mempool_txids)
         if self.plan.unvault_txid in mempool_txids:
             self.log("Unvault transaction detected in mempool")
             return "mempool"
@@ -527,7 +519,7 @@ class VaultExecutor:
         tx = signed_txn_fnc(*args, **kwargs)
         hx = tx.serialize().hex()
 
-        self.log(bold(f"\n## Transaction {yellow(tx.GetTxid()[::-1].hex())}"))
+        self.log(bold(f"\n## Transaction {yellow(tx.hash)}"))
         self.log(f"{tx}")
         self.log()
         self.log("### Raw hex")
@@ -594,7 +586,7 @@ def bytes_to_txid(b: bytes) -> str:
 
 
 def to_outpoint(txid: TxidStr, n: int) -> COutPoint:
-    return COutPoint(txid_to_bytes(txid), n)
+    return COutPoint(int(txid, 16), n)
 
 
 def scan_utxos(rpc, addr):
@@ -619,7 +611,7 @@ class VaultScenario:
 
     @classmethod
     def from_network(cls, network: str, seed: bytes, coin: Coin = None, **plan_kwargs):
-        SelectParams(network)
+        # SelectParams(network)
         from_wallet = Wallet.generate(b"from-" + seed)
         fee_wallet = Wallet.generate(b"fee-" + seed)
         cold_wallet = Wallet.generate(b"cold-" + seed)
@@ -677,7 +669,7 @@ def vault():
 
     c.exec.send_to_vault(c.coin_in, c.from_wallet.privkey)
     assert not c.exec.search_for_unvault()
-    original_coin_txid = c.coin_in.outpoint.hash[::-1].hex()
+    original_coin_txid = c.coin_in.outpoint.hash
     print(original_coin_txid)
 
 

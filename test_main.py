@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from bitcoin.core import CTransaction, COIN
+from test_framework.messages import CTransaction, COIN, from_hex
 
 from rpc import JSONRPCError
 from main import (
@@ -28,6 +28,7 @@ def _run_functional_test(ends_in_hot=True):
     """
     block_delay = 3
     c = VaultScenario.from_network("regtest", seed=b"functest", block_delay=block_delay)
+    c.exec.log = print
     exec = c.exec
     plan = c.plan
     rpc = c.rpc
@@ -86,12 +87,12 @@ def _run_functional_test(ends_in_hot=True):
         generateblocks(rpc, block_delay - 1)
 
         txid = rpc.sendrawtransaction(tohot_hex)
-        assert txid == tohot_tx.GetTxid()[::-1].hex()
+        assert txid == tohot_tx.hash
     else:
         # "Sweep" the funds to the cold wallet because this is an unvaulting
         # we didn't expect.
         txid = rpc.sendrawtransaction(tocold_hex)
-        assert txid == tocold_tx.GetTxid()[::-1].hex()
+        assert txid == tocold_tx.hash
 
     generateblocks(rpc, 1)
     txout = rpc.gettxout(txid, 0)
@@ -112,7 +113,7 @@ def test_ctv_hash():
     tests = 0
 
     for case in data:
-        tx = CTransaction.deserialize(bytearray.fromhex(case["hex_tx"]))
+        tx = from_hex(CTransaction(), case["hex_tx"])
 
         for idx, res in zip(case["spend_index"], case["result"]):
             assert get_standard_template_hash(tx, idx).hex() == res
