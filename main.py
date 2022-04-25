@@ -43,12 +43,12 @@ import typing as t
 from dataclasses import dataclass
 
 from test_framework import script
+from test_framework.key import sign_schnorr
 from test_framework.messages import (
     CTransaction,
     CTxIn,
     CTxOut,
     COutPoint,
-    CTxWitness,
     CTxInWitness,
     COIN,
 )
@@ -157,6 +157,9 @@ class VaultPlan:
 
     """
 
+    # Taproot internal pubkey
+    internal_pubkey: bytes
+
     # SEC-encoded public keys associated with various identities in the vault scheme.
     hot_pubkey: S256Point
     cold_pubkey: S256Point
@@ -202,6 +205,16 @@ class VaultPlan:
     # -------------------------------
 
     @property
+    def tovault_taproot_info(self):
+        return script.taproot_construct(
+            self.internal_pubkey,
+            [(
+                "tovault",
+                CScript([self.unvault_ctv_hash, OP_CHECKTEMPLATEVERIFY]),
+            )],
+        )
+
+    @property
     def tovault_tx_unsigned(self) -> CTransaction:
         """
         Spend from a P2WPKH output into a new vault.
@@ -215,7 +228,7 @@ class VaultPlan:
         tx.vout = [
             CTxOut(
                 self.amount_at_step(1),
-                CScript([self.unvault_ctv_hash, OP_CHECKTEMPLATEVERIFY]),
+                self.tovault_taproot_info.scriptPubKey,
             )
         ]
         tx.calc_sha256()
@@ -282,27 +295,38 @@ class VaultPlan:
         tx.vout = [
             CTxOut(
                 self.amount_at_step(2),
-                # Standard P2WSH output:
-                CScript([script.OP_0, sha256(self.unvault_redeemScript)]),
+                self.unvault_taproot_info.scriptPubKey,
             )
         ]
         tx.calc_sha256()
         return tx
 
     @property
-    def unvault_redeemScript(self) -> CScript:
+    def unvault_to_hot_script(self) -> CScript:
         return CScript(
             [
-                # fmt: off
-                script.OP_IF,
-                    self.block_delay, script.OP_CHECKSEQUENCEVERIFY, script.OP_DROP,
-                    self.hot_pubkey.sec(), script.OP_CHECKSIG,
-                script.OP_ELSE,
-                    self.tocold_ctv_hash, OP_CHECKTEMPLATEVERIFY,
-                script.OP_ENDIF,
-                # fmt: on
+                self.block_delay,
+                script.OP_CHECKSEQUENCEVERIFY,
+                script.OP_DROP,
+                self.hot_pubkey.bip340(),
+                script.OP_CHECKSIG,
             ]
         )
+
+    @property
+    def unvault_to_cold_script(self) -> CScript:
+        return CScript([self.tocold_ctv_hash, OP_CHECKTEMPLATEVERIFY])
+
+    @property
+    def unvault_taproot_info(self):
+        taproot_info = script.taproot_construct(
+            self.internal_pubkey,
+            [
+                ("unvault_to_hot", self.unvault_to_hot_script),
+                ("unvault_to_cold", self.unvault_to_cold_script),
+            ],
+        )
+        return taproot_info
 
     @property
     def unvault_tx_unsigned(self) -> CTransaction:
@@ -312,8 +336,22 @@ class VaultPlan:
         return CTransaction(tx)
 
     def sign_unvault_tx(self):
-        # No signing necessary with a bare CTV output!
-        return self.unvault_tx_unsigned
+        """Create the witness for the Unvault. Single leaf, the covenant, no sig needed."""
+        tx = self.unvault_tx_unsigned
+
+        tapleaf_info = self.tovault_taproot_info.leaves["tovault"]
+        control_block = (
+            bytes([tapleaf_info.version + self.tovault_taproot_info.negflag])
+            + self.tovault_taproot_info.internal_pubkey
+            + tapleaf_info.merklebranch
+        )
+        tx.wit.vtxinwit.append(CTxInWitness())
+        tx.wit.vtxinwit[0].scriptWitness.stack = [
+            bytes(tapleaf_info.script),
+            control_block,
+        ]
+
+        return tx
 
     # tocold transaction
     # -------------------------------
@@ -343,12 +381,19 @@ class VaultPlan:
         return tx
 
     def sign_tocold_tx(self):
+        """Spend from the leaf with the covenant, no signature needed."""
         tx = self.tocold_tx_unsigned
-        # Use the amount from the last step for the sighash.
-        tx.wit = CTxWitness()
+        tapleaf_info = self.unvault_taproot_info.leaves["unvault_to_cold"]
+        control_block = (
+            bytes([tapleaf_info.version + self.unvault_taproot_info.negflag])
+            + self.unvault_taproot_info.internal_pubkey
+            + tapleaf_info.merklebranch
+        )
         tx.wit.vtxinwit.append(CTxInWitness())
-        tx.wit.vtxinwit[0].scriptWitness.stack = [b"", self.unvault_redeemScript]
-
+        tx.wit.vtxinwit[0].scriptWitness.stack = [
+            bytes(tapleaf_info.script),
+            control_block,
+        ]
         return CTransaction(tx)
 
     # tohot transaction
@@ -378,19 +423,32 @@ class VaultPlan:
         """
         tx = self.tohot_tx_unsigned
 
-        sighash = script.SegwitV0SignatureHash(
-            self.unvault_redeemScript,
-            tx,
-            0,
-            script.SIGHASH_ALL,
-            amount=self.amount_at_step(2),  # the prior step amount
+        # Gather the Taproot data, choose the leaf spending to hot key after a delay
+        tapleaf_info = self.unvault_taproot_info.leaves["unvault_to_hot"]
+        control_block = (
+            bytes([tapleaf_info.version + self.unvault_taproot_info.negflag])
+            + self.unvault_taproot_info.internal_pubkey
+            + tapleaf_info.merklebranch
         )
-        sig = hot_priv.sign(int.from_bytes(sighash, "big")).der() + bytes(
-            [script.SIGHASH_ALL]
-        )
-        tx.wit.vtxinwit.append(CTxInWitness())
-        tx.wit.vtxinwit[0].scriptWitness.stack = [sig, b"\x01", self.unvault_redeemScript]
 
+        # Sign the transaction with the hot key
+        sighash = script.TaprootSignatureHash(
+            txTo=tx,
+            spent_utxos=[self.unvault_tx_unsigned.vout[0]],
+            hash_type=script.SIGHASH_DEFAULT,
+            input_index=0,
+            scriptpath=True,
+            script=tapleaf_info.script,
+        )
+        sig = sign_schnorr(hot_priv.secret.to_bytes(32, "big"), sighash)
+
+        # And finally fill the witness
+        tx.wit.vtxinwit.append(CTxInWitness())
+        tx.wit.vtxinwit[0].scriptWitness.stack = [
+            sig,
+            bytes(tapleaf_info.script),
+            control_block,
+        ]
         return CTransaction(tx)
 
 
@@ -500,7 +558,6 @@ class VaultExecutor:
         """
         mempool_txids = self.rpc.getrawmempool(False)
 
-        print(self.plan.tovault_txid, self.plan.unvault_txid, mempool_txids)
         if self.plan.unvault_txid in mempool_txids:
             self.log("Unvault transaction detected in mempool")
             return "mempool"
@@ -611,7 +668,9 @@ class VaultScenario:
 
     @classmethod
     def from_network(cls, network: str, seed: bytes, coin: Coin = None, **plan_kwargs):
-        # SelectParams(network)
+        # NUMS from bip-0341
+        internal_pubkey = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+
         from_wallet = Wallet.generate(b"from-" + seed)
         fee_wallet = Wallet.generate(b"fee-" + seed)
         cold_wallet = Wallet.generate(b"cold-" + seed)
@@ -620,6 +679,7 @@ class VaultScenario:
         rpc = BitcoinRPC(net_name=network)
         coin = coin or from_wallet.fund(rpc)
         plan = VaultPlan(
+            internal_pubkey,
             hot_wallet.privkey.point,
             cold_wallet.privkey.point,
             fee_wallet.privkey.point,
