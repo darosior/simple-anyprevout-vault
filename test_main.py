@@ -1,14 +1,10 @@
-import json
-from pathlib import Path
-
 import pytest
-from test_framework.messages import CTransaction, COIN, from_hex
+from test_framework.messages import CTransaction, COIN
 
 from rpc import JSONRPCError
 from main import (
     VaultScenario,
     generateblocks,
-    get_standard_template_hash,
 )
 
 
@@ -106,18 +102,3 @@ def _run_functional_test(ends_in_hot=True):
     fees_addr = plan.fees_pubkey.p2wpkh_address(rpc.net_name)
     assert anchor_txout['value'] > 0
     assert anchor_txout['scriptPubKey']['address'] == fees_addr
-
-
-def test_ctv_hash():
-    data = json.loads(Path("ctvhash-test-vectors.json").read_bytes())[1:-1]
-    tests = 0
-
-    for case in data:
-        tx = from_hex(CTransaction(), case["hex_tx"])
-
-        for idx, res in zip(case["spend_index"], case["result"]):
-            assert get_standard_template_hash(tx, idx).hex() == res
-            tests += 1
-
-    print(tests)
-    assert tests > 0

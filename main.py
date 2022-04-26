@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Implementation of a simple OP_CTV vault.
+Implementation of a simple ANYPREVOUT vault.
 
           output you're spending from
                      |
              tovault_tx output
-                (<H> OP_CTV)
+     (<APOAS sig(unvault tx)> <pk> CHECKSIG)
                      |
                  unvault_tx
-        (OP_CSV hot_pk | (<H(tocold_tx)> OP_CTV)
+        (OP_CSV hot_pk | (<APOAS sig(tocold_tx)> <pk> CHECKSIG)
               /               \
         tohot_tx           tocold_tx
                         (cold_pk OP_CHECKSIG)
@@ -141,16 +141,16 @@ class Wallet:
 class VaultPlan:
     """
     Template and generate transactions for a one-hop vault structure based on
-    OP_CHECKTEMPLATEVERIFY.
+    SIGHASH_ANYPREVOUTANYSCRIPT.
 
 
           output you're spending from              amount0
                      |
              tovault_tx output                     amount1
-                (<H> OP_CTV)
+                (<APOAS sig(unvault tx)> <pk> CHECKSIG)
                      |
                  unvault_tx                        amount2
-        (OP_CSV hot_pk | (<H(tocold_tx)> OP_CTV)
+        (OP_CSV hot_pk | (<APOAS sig(tocold_tx)> <pk> CHECKSIG)
               /               \
         tohot_tx           tocold_tx
                         (cold_pk OP_CHECKSIG)      amount3
@@ -235,8 +235,9 @@ class VaultPlan:
         """
         Spend from a P2WPKH output into a new vault.
 
-        The output is a bare OP_CTV script, which consumes less chain space
-        than a P2(W)SH.
+        The output is a Taproot that may only be spent using the Script path. The
+        Script path features an APOAS signature that serves as a covenant to the
+        Unvault transaction.
         """
         tx = CTransaction()
         tx.nVersion = 2
@@ -282,11 +283,6 @@ class VaultPlan:
     # -------------------------------
 
     @property
-    def unvault_ctv_hash(self) -> bytes:
-        """Return the CTV hash for the unvaulting transaction."""
-        return get_standard_template_hash(self.unvault_tx_template, 0)
-
-    @property
     def unvault_tx_template(self) -> CTransaction:
         """
         Return the transaction that initiates the unvaulting process.
@@ -295,18 +291,12 @@ class VaultPlan:
         with a delay or immediately sweep funds to the cold wallet.
 
         Note that the particular `vin` value still needs to be filled in, though
-        it doesn't matter for the purposes of computing the CTV hash.
+        it doesn't matter for the purposes of computing the APOAS sighash. This is
+        because APOAS has "ANYONECANPAY semantics", but in this case it's a footgun
+        when reusing addresses.
         """
-        # Used to compute CTV hashes, but not used in any final transactions.
         tx = CTransaction()
         tx.nVersion = 2
-        # We can leave this as a dummy input, since the coin we're spending here is
-        # encumbered solely by CTV, e.g.
-        #
-        #   `<H> OP_CTV`
-        #
-        # and so doesn't require any kind of scriptSig. Subsequently, it won't affect the
-        # hash of this transaction.
         tx.vin = [BLANK_INPUT()]
         tx.vout = [
             CTxOut(
@@ -398,10 +388,6 @@ class VaultPlan:
             pay_to_h160=self.cold_pubkey.hash160(),
             fee_mgmt_pay_to_h160=self.fees_pubkey.hash160(),
         )
-
-    @property
-    def tocold_ctv_hash(self) -> bytes:
-        return get_standard_template_hash(self.tocold_tx_template, 0)
 
     @property
     def tocold_tx_unsigned(self) -> CTransaction:
@@ -631,53 +617,6 @@ def sha256(s) -> bytes:
     return hashlib.sha256(s).digest()
 
 
-def ser_compact_size(l) -> bytes:
-    r = b""
-    if l < 253:
-        r = struct.pack("B", l)
-    elif l < 0x10000:
-        r = struct.pack("<BH", 253, l)
-    elif l < 0x100000000:
-        r = struct.pack("<BI", 254, l)
-    else:
-        r = struct.pack("<BQ", 255, l)
-    return r
-
-
-def ser_string(s) -> bytes:
-    return ser_compact_size(len(s)) + s
-
-
-def get_standard_template_hash(tx: CTransaction, nIn: int) -> bytes:
-    r = b""
-    r += struct.pack("<i", tx.nVersion)
-    r += struct.pack("<I", tx.nLockTime)
-    vin = tx.vin or []
-    vout = tx.vout or []
-    if any(inp.scriptSig for inp in vin):
-        r += sha256(b"".join(ser_string(inp.scriptSig) for inp in vin))
-    r += struct.pack("<I", len(tx.vin))
-    r += sha256(b"".join(struct.pack("<I", inp.nSequence) for inp in vin))
-    r += struct.pack("<I", len(tx.vout))
-    r += sha256(b"".join(out.serialize() for out in vout))
-    r += struct.pack("<I", nIn)
-    return sha256(r)
-
-
-def txid_to_bytes(txid: str) -> bytes:
-    """Convert the txids output by Bitcoin Core (little endian) to bytes."""
-    return bytes.fromhex(txid)[::-1]
-
-
-def bytes_to_txid(b: bytes) -> str:
-    """Convert big-endian bytes to Core-style txid str."""
-    return b[::-1].hex()
-
-
-def to_outpoint(txid: TxidStr, n: int) -> COutPoint:
-    return COutPoint(int(txid, 16), n)
-
-
 def scan_utxos(rpc, addr):
     return rpc.scantxoutset("start", [f"addr({addr})"])
 
@@ -818,7 +757,7 @@ def to_cold(original_coin_txid: TxidStr):
 def _broadcast_final(c: VaultScenario, tx: CTransaction, hot_or_cold: str):
     print()
     if hot_or_cold == 'cold':
-        title = f"CTV-encumbering to {cyan('cold')}"
+        title = f"APOAS-encumbering to {cyan('cold')}"
     else:
         title = f"spending to {red('hot')}"
 
