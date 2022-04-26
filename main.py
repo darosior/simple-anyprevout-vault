@@ -43,7 +43,7 @@ import typing as t
 from dataclasses import dataclass
 
 from test_framework import script
-from test_framework.key import sign_schnorr
+from test_framework.key import compute_xonly_pubkey, sign_schnorr
 from test_framework.messages import (
     CTransaction,
     CTxIn,
@@ -61,7 +61,7 @@ from clii import App
 
 cli = App(usage=__doc__)
 
-OP_CHECKTEMPLATEVERIFY = script.OP_NOP4
+COVENANT_SIGHASH = script.SIGHASH_ALL | script.SIGHASH_ANYPREVOUTANYSCRIPT
 
 Sats = int
 SatsPerByte = int
@@ -206,11 +206,27 @@ class VaultPlan:
 
     @property
     def tovault_taproot_info(self):
+        # Create a signature that commits to the spending transaction, that we put
+        # in the scriptPubKey in order to create a covenant.
+        # We use a dummy private key, since we can't use the Taproot internal key.
+        sighash = script.TaprootSignatureHash(
+            txTo=self.unvault_tx_template,
+            spent_utxos=[CTxOut()],  # We don't commit to the spent UTxOs
+            hash_type=COVENANT_SIGHASH,
+            input_index=0,
+            scriptpath=True,
+            script=CScript(),  # We don't commit to the Script
+            key_ver=script.KEY_VERSION_ANYPREVOUT,
+        )
+        dummy_priv = bytes(31) + b"\x01"
+        dummy_pubkey, _ = compute_xonly_pubkey(dummy_priv)
+        sig = sign_schnorr(dummy_priv, sighash) + bytes([COVENANT_SIGHASH])
+        key = bytes([script.KEY_VERSION_ANYPREVOUT]) + dummy_pubkey
         return script.taproot_construct(
             self.internal_pubkey,
             [(
                 "tovault",
-                CScript([self.unvault_ctv_hash, OP_CHECKTEMPLATEVERIFY]),
+                CScript([sig, key, script.OP_CHECKSIG]),
             )],
         )
 
@@ -315,7 +331,23 @@ class VaultPlan:
 
     @property
     def unvault_to_cold_script(self) -> CScript:
-        return CScript([self.tocold_ctv_hash, OP_CHECKTEMPLATEVERIFY])
+        # Create a signature that commits to the spending transaction, that we put
+        # in the scriptPubKey in order to create a covenant.
+        # We use a dummy privkey, since we can't use the Taproot internal key.
+        sighash = script.TaprootSignatureHash(
+            txTo=self.tocold_tx_template,
+            spent_utxos=[CTxOut()],  # We don't commit to the spend UTxOs
+            hash_type=COVENANT_SIGHASH,
+            input_index=0,
+            scriptpath=True,
+            script=CScript(),  # We don't commit to the Script
+            key_ver=script.KEY_VERSION_ANYPREVOUT,
+        )
+        dummy_priv = bytes(31) + b"\x01"
+        dummy_pubkey, _ = compute_xonly_pubkey(dummy_priv)
+        sig = sign_schnorr(dummy_priv, sighash) + bytes([COVENANT_SIGHASH])
+        key = bytes([script.KEY_VERSION_ANYPREVOUT]) + dummy_pubkey
+        return CScript([sig, key, script.OP_CHECKSIG])
 
     @property
     def unvault_taproot_info(self):
